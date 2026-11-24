@@ -89,6 +89,14 @@ class ArchiveSummary(BaseModel):
     tolerance_tenths_c: int
     max_retained_points: int
     retained_points_count: int
+    measured_anchor_count: int = Field(
+        default=0,
+        description="Retained points holding original measured sample values.",
+    )
+    reconstructed_anchor_count: int = Field(
+        default=0,
+        description="Retained points holding interpolated values from a split.",
+    )
     measured_minutes: int
     missing_minutes: int
     segment_count: int
@@ -107,6 +115,19 @@ class MinuteSample(BaseModel):
     value_tenths_c: Optional[int]
     missing: bool
     band_state: str = Field(description="below | in_band | above; 'unknown' if missing")
+    value_source: str = Field(
+        default="unknown",
+        description=(
+            "Provenance of the returned value: 'measured' when the minute is a "
+            "retained original sample, 'reconstructed' when the value comes from "
+            "interpolation (including anchors introduced by a split), 'unknown' "
+            "for missing minutes."
+        ),
+    )
+    retained: bool = Field(
+        default=False,
+        description="Whether this minute is stored as a retained anchor point.",
+    )
 
 
 class BandInterval(BaseModel):
@@ -143,6 +164,47 @@ class ArchiveListItem(BaseModel):
 
 class ArchiveListResponse(BaseModel):
     archives: list[ArchiveListItem]
+
+
+class ArchiveSplitRequest(BaseModel):
+    """Split one archived run into two independent furnace runs."""
+
+    expected_summary: ArchiveSummary = Field(
+        description=(
+            "The summary of the current archive as returned by GET "
+            "/archives/{run_id}. The split is rejected if it no longer matches."
+        )
+    )
+    back_run_start_minute_utc: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=10_000_000_000,
+            description=(
+                "First UTC minute belonging to the back furnace run; the front "
+                "run ends one minute earlier. Must lie strictly inside the run."
+            ),
+        ),
+    ]
+    new_run_id: RunId = Field(
+        description="Run id assigned to the back run. The front run keeps the id.",
+        examples=["HT-2026-0043"],
+    )
+
+    @model_validator(mode="after")
+    def _new_id_must_differ(self) -> "ArchiveSplitRequest":
+        if self.new_run_id == self.expected_summary.run_id:
+            raise ValueError(
+                "new_run_id must differ from the original archive run_id"
+            )
+        return self
+
+
+class ArchiveSplitResponse(BaseModel):
+    status: str = "split"
+    front_archive: ArchiveSummary
+    back_archive: ArchiveSummary
+    split_at_minute_utc: int
 
 
 class ErrorResponse(BaseModel):

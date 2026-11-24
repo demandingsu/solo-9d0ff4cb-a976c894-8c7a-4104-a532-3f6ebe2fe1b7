@@ -31,6 +31,8 @@ from .models import (
     ArchiveListItem,
     ArchiveListResponse,
     ArchiveQueryResponse,
+    ArchiveSplitRequest,
+    ArchiveSplitResponse,
     ArchiveSummary,
     BandInterval,
     ErrorResponse,
@@ -44,6 +46,8 @@ from .planner import (
     plan_archive,
     reconstruct_spans,
 )
+from . import split as split_mod
+from .split import SOURCE_RECONSTRUCTED
 
 
 def _store_path() -> str:
@@ -51,7 +55,9 @@ def _store_path() -> str:
 
 
 def _summary(archive: db.StoredArchive) -> ArchiveSummary:
-    measured = sum(end - start for start, end in archive.spans)
+    data = db.archive_summary_dict(archive)
+    sources = archive.effective_sources
+    measured_anchors = sum(1 for source in sources if source == split_mod.SOURCE_MEASURED)
     return ArchiveSummary(
         run_id=archive.run_id,
         start_minute_utc=archive.start_minute_utc,
@@ -62,8 +68,10 @@ def _summary(archive: db.StoredArchive) -> ArchiveSummary:
         tolerance_tenths_c=archive.tolerance_tenths_c,
         max_retained_points=archive.max_retained_points,
         retained_points_count=archive.retained_count,
-        measured_minutes=measured,
-        missing_minutes=archive.minute_count - measured,
+        measured_anchor_count=measured_anchors,
+        reconstructed_anchor_count=archive.retained_count - measured_anchors,
+        measured_minutes=data["measured_minutes"],
+        missing_minutes=data["missing_minutes"],
         segment_count=len(archive.spans),
         payload_sha256=archive.payload_sha256,
         planner_version=archive.planner_version,
@@ -380,10 +388,20 @@ def create_app() -> FastAPI:
         offset_end = end_minute_utc - archive.start_minute_utc + 1
         window = values[offset_start:offset_end]
 
+        # Per-anchor provenance, so queries can distinguish real retained
+        # samples from values reconstructed by interpolation or a split.
+        anchor_sources = {
+            offset: source
+            for (offset, _), source in zip(
+                archive.retained_points, archive.effective_sources
+            )
+        }
+
         minutes: list[MinuteSample] = []
         missing_minutes: list[int] = []
         for index, value in enumerate(window):
             minute = start_minute_utc + index
+            offset = offset_start + index
             if value is None:
                 missing_minutes.append(minute)
                 minutes.append(
@@ -392,9 +410,12 @@ def create_app() -> FastAPI:
                         value_tenths_c=None,
                         missing=True,
                         band_state="unknown",
+                        value_source="unknown",
+                        retained=False,
                     )
                 )
                 continue
+            source = anchor_sources.get(offset, SOURCE_RECONSTRUCTED)
             minutes.append(
                 MinuteSample(
                     minute_utc=minute,
@@ -403,6 +424,8 @@ def create_app() -> FastAPI:
                     band_state=_band_state(
                         value, archive.band_low_tenths_c, archive.band_high_tenths_c
                     ),
+                    value_source=source,
+                    retained=offset in anchor_sources,
                 )
             )
 
@@ -440,6 +463,110 @@ def create_app() -> FastAPI:
             in_band_intervals=intervals,
             missing_minutes=missing_minutes,
             payload_sha256=archive.payload_sha256,
+        )
+
+    @api.post(
+        "/archives/{run_id}/split",
+        response_model=ArchiveSplitResponse,
+        status_code=status.HTTP_200_OK,
+        responses={
+            404: {"model": ErrorResponse, "description": "Run not archived"},
+            409: {"model": ErrorResponse, "description": "Summary mismatch or new run id taken"},
+            422: {"model": ErrorResponse, "description": "No feasible split or invalid request"},
+            500: {"model": ErrorResponse, "description": "Archive corrupt"},
+            503: {"model": ErrorResponse, "description": "Split write failed"},
+        },
+        tags=["archive"],
+        summary="Split one archived run into two independent furnace runs",
+    )
+    def split_archive(
+        run_id: Annotated[str, Path(min_length=1, max_length=64)],
+        payload: ArchiveSplitRequest,
+    ) -> JSONResponse:
+        store = db.ArchiveStore(_store_path())
+        archive = _load_archive(store, run_id)
+
+        if payload.expected_summary.run_id != run_id:
+            raise ApiError(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "invalid_request",
+                "expected_summary.run_id must match the split path run_id",
+            )
+
+        try:
+            plan = split_mod.plan_split(
+                run_id=archive.run_id,
+                new_run_id=payload.new_run_id,
+                start_minute_utc=archive.start_minute_utc,
+                minute_count=archive.minute_count,
+                spans=archive.spans,
+                anchors=dict(archive.retained_points),
+                anchor_sources=archive.effective_sources,
+                max_retained=archive.max_retained_points,
+                cut_minute_utc=payload.back_run_start_minute_utc,
+            )
+        except PlanError as exc:
+            details = exc.details
+            return _error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "no_feasible_split",
+                exc.message,
+                minimum=details.get("minimum_retained_points"),
+                maximum=details.get("max_retained_points"),
+            )
+
+        try:
+            front, back = store.replace_with_split(
+                original_run_id=run_id,
+                new_run_id=payload.new_run_id,
+                expected_summary=payload.expected_summary.model_dump(),
+                plan=plan,
+                band_low=archive.band_low_tenths_c,
+                band_high=archive.band_high_tenths_c,
+                tolerance=archive.tolerance_tenths_c,
+                max_retained=archive.max_retained_points,
+            )
+        except db.ArchiveNotFound as exc:
+            raise ApiError(
+                status.HTTP_404_NOT_FOUND,
+                "archive_not_found",
+                f"run {exc.run_id!r} has no archive",
+            ) from exc
+        except db.ArchiveSummaryMismatch as exc:
+            return _error(
+                status.HTTP_409_CONFLICT,
+                "summary_mismatch",
+                f"the submitted summary is stale: {exc}",
+            )
+        except db.ArchiveConflict as exc:
+            return _error(
+                status.HTTP_409_CONFLICT,
+                "run_already_archived",
+                f"new run id {exc.run_id!r} is already in use; the original "
+                "archive was left unchanged",
+            )
+        except db.ArchiveWriteError as exc:
+            return _error(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "archive_write_failed",
+                exc.message,
+                retryable=exc.retryable,
+            )
+        except db.ArchiveUnavailable as exc:
+            return _error(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "archive_unavailable",
+                str(exc),
+                retryable=True,
+            )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=ArchiveSplitResponse(
+                front_archive=_summary(front),
+                back_archive=_summary(back),
+                split_at_minute_utc=payload.back_run_start_minute_utc,
+            ).model_dump(),
         )
 
     app.include_router(api)
